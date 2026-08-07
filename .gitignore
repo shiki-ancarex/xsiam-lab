@@ -1,0 +1,29 @@
+# ── NUNCA subir credenciales ────────────────────────────────────────────
+config.json
+*/config.json
+.env
+*.key
+*.pem
+
+# ── Salidas del simulador (incluyen el ground truth: spoiler del capstone) ──
+out/
+*/out/
+ground_truth_*.json
+paquete_alumno/
+*.log
+
+# ── Exports de alertas de los equipos ───────────────────────────────────
+*_alertas.csv
+alertas_*.csv
+
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── Editores / SO ───────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/settings.json

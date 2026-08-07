@@ -1,0 +1,15 @@
+# Los scripts .sh y el devcontainer DEBEN tener finales de línea LF, o Linux
+# (y el Codespace) los rechaza con "bad interpreter: /bin/bash^M".
+# Windows los convierte a CRLF sin avisar; esto lo impide.
+*.sh        text eol=lf
+*.json      text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.md        text eol=lf
+
+# Los .ps1 sí van con finales de Windows
+*.ps1       text eol=crlf
+
+# Binarios: que Git no los toque
+*.pdf       binary
+*.png       binary

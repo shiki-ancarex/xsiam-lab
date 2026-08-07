@@ -1,0 +1,68 @@
+{
+  "_comentario": "Copia este archivo a config.json y pega las API keys de tus colectores HTTP. NUNCA subas config.json a un repositorio.",
+
+  "tenant_api_url": "https://api-xsiamnfrsentria.xdr.us.paloaltonetworks.com/logs/v1/event",
+
+  "collectors": {
+    "waf": {
+      "_xsiam": "Custom Collector HTTP | Vendor: imperva | Product: securesphere | Log format: CEF | Compression: none",
+      "_dataset_esperado": "imperva_securesphere_raw",
+      "api_key": "PEGA_AQUI_LA_API_KEY_DEL_COLECTOR_WAF",
+      "compress": false
+    },
+    "fw": {
+      "_xsiam": "Custom Collector HTTP | Vendor: andina | Product: ngfw | Log format: Raw | Compression: none",
+      "_dataset_esperado": "andina_ngfw_raw",
+      "api_key": "PEGA_AQUI_LA_API_KEY_DEL_COLECTOR_FW",
+      "compress": false
+    },
+    "edr": {
+      "_xsiam": "Custom Collector HTTP | Vendor: andina | Product: edr | Log format: JSON | Compression: none",
+      "_dataset_esperado": "andina_edr_raw",
+      "api_key": "PEGA_AQUI_LA_API_KEY_DEL_COLECTOR_EDR",
+      "compress": false
+    },
+    "auth": {
+      "_xsiam": "Custom Collector HTTP | Vendor: andina | Product: idp | Log format: JSON | Compression: none",
+      "_dataset_esperado": "andina_idp_raw",
+      "api_key": "PEGA_AQUI_LA_API_KEY_DEL_COLECTOR_AUTH",
+      "compress": false
+    }
+  },
+
+  "_teams_comentario": [
+    "SECCION SOLO PARA EL INSTRUCTOR. Los alumnos NO la necesitan: ellos usan la",
+    "seccion 'collectors' de arriba con sus propias API keys.",
+    "",
+    "Pega aqui las API keys que cada equipo te entregue al final del Dia 2. Con esto",
+    "puedes lanzar el capstone contra los cuatro equipos a la vez, cada uno con su",
+    "propia variante del escenario:",
+    "",
+    "  python run_lab.py --all-teams check",
+    "  python run_lab.py --all-teams --quiet-progress attack --live --speed 10 --with-impact",
+    "",
+    "Si cada equipo tiene su propio tenant, agrega 'tenant_api_url' dentro del equipo."
+  ],
+
+  "teams": {
+    "equipo_azul": {
+      "variant": 1,
+      "collectors": {
+        "waf":  {"api_key": "API_KEY_WAF_DEL_EQUIPO_AZUL"},
+        "fw":   {"api_key": "API_KEY_FW_DEL_EQUIPO_AZUL"},
+        "edr":  {"api_key": "API_KEY_EDR_DEL_EQUIPO_AZUL"},
+        "auth": {"api_key": "API_KEY_AUTH_DEL_EQUIPO_AZUL"}
+      }
+    },
+    "equipo_rojo": {
+      "variant": 2,
+      "tenant_api_url": "https://api-otro-tenant.xdr.us.paloaltonetworks.com/logs/v1/event",
+      "collectors": {
+        "waf":  {"api_key": "API_KEY_WAF_DEL_EQUIPO_ROJO"},
+        "fw":   {"api_key": "API_KEY_FW_DEL_EQUIPO_ROJO"},
+        "edr":  {"api_key": "API_KEY_EDR_DEL_EQUIPO_ROJO"},
+        "auth": {"api_key": "API_KEY_AUTH_DEL_EQUIPO_ROJO"}
+      }
+    }
+  }
+}
