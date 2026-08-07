@@ -24,7 +24,9 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import string
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -71,12 +73,34 @@ USER_AGENTS_OK = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
 ]
 
+# Rutas legítimas. Muchas llevan parámetros: si solo los ataques tuvieran
+# payload, detectarlos sería trivial y no se aprendería nada.
 WEB_PATHS_OK = [
-    "/", "/catalogo", "/catalogo/electrodomesticos", "/producto/ver",
-    "/carrito", "/checkout", "/api/v1/precios", "/api/v1/stock",
-    "/cuenta/login", "/cuenta/pedidos", "/static/app.js", "/static/estilos.css",
-    "/buscar", "/sucursales", "/promociones",
+    "/", "/catalogo", "/catalogo/electrodomesticos", "/producto/ver?id={id}",
+    "/carrito", "/checkout", "/api/v1/precios?sku={sku}",
+    "/api/v1/stock?sku={sku}&sucursal={suc}", "/cuenta/login",
+    "/cuenta/pedidos?pagina={pag}", "/static/app.js", "/static/estilos.css",
+    "/buscar?q={q}", "/sucursales?ciudad={ciudad}", "/promociones",
+    "/catalogo?orden=precio&pagina={pag}", "/producto/ver?id={id}&color={color}",
 ]
+
+_TERMINOS = ["nevera", "lavadora", "televisor", "licuadora", "microondas",
+             "aire+acondicionado", "estufa", "audifonos", "portatil", "cafetera"]
+_CIUDADES = ["bogota", "medellin", "cali", "barranquilla", "bucaramanga"]
+_COLORES = ["negro", "blanco", "plata", "azul"]
+
+
+def ruta_realista(rng: random.Random) -> str:
+    """Rellena la plantilla de una ruta legítima con valores plausibles."""
+    plantilla = rng.choice(WEB_PATHS_OK)
+    return (plantilla
+            .replace("{id}", str(rng.randint(1000, 9999)))
+            .replace("{sku}", f"SKU-{rng.randint(10000, 99999)}")
+            .replace("{suc}", str(rng.randint(1, 40)))
+            .replace("{pag}", str(rng.randint(1, 12)))
+            .replace("{q}", rng.choice(_TERMINOS))
+            .replace("{ciudad}", rng.choice(_CIUDADES))
+            .replace("{color}", rng.choice(_COLORES)))
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -184,6 +208,11 @@ def waf_event(
     bytes_in: int = 0,
     bytes_out: int = 0,
     dst: str = "10.20.30.11",
+    referer: str | None = None,
+    payload: str = "",
+    matched_param: str = "",
+    account: str = "",
+    session: str | None = None,
     host: str = "waf-dmz-01",
     rng: random.Random | None = None,
 ) -> str:
@@ -191,6 +220,38 @@ def waf_event(
     ua = user_agent or rng.choice(USER_AGENTS_OK)
     name = signature if signature != "None" else "HTTP Request"
     cat, attack_type, mitre = _threat_taxonomy(signature)
+
+    # Contexto completo de la petición. Un WAF real captura el "href" de origen
+    # y, cuando hay violación, el trozo exacto que la disparó — para que el
+    # analista no tenga que ir a otro sistema a reconstruirla.
+    ref = referer if referer is not None else _referer_para(path, rng, ua)
+    sid = session or rand_hex(24, rng)
+    if not payload and "?" in path:
+        payload = path.split("?", 1)[1]
+    if not matched_param and "=" in payload:
+        matched_param = payload.split("=", 1)[0]
+
+    # Una SQL injection ciega basada en tiempo TARDA lo que pide el payload.
+    # Es la unica huella que deja: ni la firma ni el codigo de respuesta la
+    # delatan, solo el reloj.
+    demora = _demora_de(payload, rng)
+
+    ctx = (
+        f"dhost=tienda.{DOMAIN} "
+        # suser = la cuenta que el WAF extrae del formulario o de la sesión.
+        # Un "-" significa peticion anonima: nadie autenticado detras.
+        f"suser={account or '-'} "
+        f"requestContext={ref} "
+        f"requestCookies=SESSIONID%3D{sid}%3Bcarrito%3D{rng.randint(0, 9)} "
+        f"cn3Label=ResponseTimeMs cn3={demora} "
+    )
+    if payload:
+        # URL-encoded a propósito: sin espacios, así el CEF sigue siendo
+        # parseable y el analista ve el payload tal cual viajó.
+        ctx += f"cs6Label=Payload cs6={payload[:400]} "
+    if matched_param:
+        ctx += f"flexString1Label=MatchedParam flexString1={matched_param} "
+
     ext = (
         f"rt={epoch_ms(ts)} cat={cat} src={src_ip} spt={rng.randint(1024, 65000)} "
         f"dst={dst} dpt=443 requestMethod={method} request=https://tienda.{DOMAIN}{path} "
@@ -202,7 +263,8 @@ def waf_event(
         f"cn1Label=HTTPStatus cn1={status} cn2Label=ThreatSeverity cn2={severity} "
         f"in={bytes_in} out={bytes_out} "
         f"deviceDirection=0 outcome={'Blocked' if action == 'block' else 'Allowed'} "
-        f"app=HTTPS deviceProcessName=waf-engine"
+        f"app=HTTPS deviceProcessName=waf-engine "
+        + ctx.rstrip()
     )
     cef = f"CEF:0|Imperva|SecureSphere|14.7|{_sig_id(signature)}|{name}|{severity}|{ext}"
     return ts, f"{syslog_header(ts, host, 'CEF')} {cef}"
@@ -228,6 +290,62 @@ _TAXONOMY = {
 
 def _threat_taxonomy(signature: str):
     return _TAXONOMY.get(signature, ("Application/Other", "Unknown", "-"))
+
+
+# De dónde venía el usuario. Para el tráfico legítimo suele ser una página
+# interna o un buscador; una herramienta automatizada normalmente no manda
+# Referer, y esa ausencia es en sí misma una señal.
+_REFERERS_EXTERNOS = [
+    "https://www.google.com/", "https://www.bing.com/",
+    "https://l.facebook.com/", "https://t.co/", "https://www.instagram.com/",
+]
+
+
+_CLIENTES_AUTOMATIZADOS = ("python-requests", "curl/", "sqlmap", "Nmap", "Nikto",
+                           "Go-http-client", "Scanning Engine", "Nessus", "wget")
+
+
+_PATRONES_LENTOS = ("sleep", "waitfor", "pg_sleep", "benchmark", "dbms_pipe")
+
+
+def _demora_de(payload: str, rng: random.Random) -> int:
+    """Tiempo de respuesta en ms. Los payloads que piden una pausa la obtienen.
+
+    Se decodifica primero: si no, el regex acaba leyendo los digitos del propio
+    URL-encoding (%28 se convierte en "28 segundos") en vez del argumento real.
+    """
+    texto = urllib.parse.unquote_plus(payload).lower()
+    if not any(t in texto for t in _PATRONES_LENTOS):
+        return rng.randint(12, 850)
+
+    segundos = 5
+    m = re.search(r"delay\s*'?\s*\d{1,2}:\d{2}:(\d{1,2})", texto)      # WAITFOR DELAY '00:00:05'
+    if not m:
+        m = re.search(r"(?:sleep|pg_sleep)\s*\(\s*(\d{1,2})", texto)     # SLEEP(5)
+    if not m:
+        m = re.search(r"benchmark\s*\(\s*(\d+)", texto)                  # BENCHMARK(5000000,...)
+        if m:
+            return rng.randint(2000, 6000)
+    if m:
+        segundos = int(m.group(1))
+    segundos = max(1, min(segundos, 30))
+    return segundos * 1000 + rng.randint(5, 90)
+
+
+def _referer_para(path: str, rng: random.Random, ua: str = "") -> str:
+    # Una herramienta automatizada no encadena Referer. La ausencia de cabecera
+    # en una petición con parámetros es una señal por sí sola.
+    if any(t in ua for t in _CLIENTES_AUTOMATIZADOS):
+        return "-"
+    base = f"https://tienda.{DOMAIN}"
+    if path in ("/", "/catalogo", "/promociones"):
+        return rng.choice(_REFERERS_EXTERNOS) if rng.random() < 0.6 else "-"
+    if path.startswith("/static/") or path.startswith("/api/"):
+        return f"{base}/catalogo"
+    return rng.choice([
+        f"{base}/catalogo", f"{base}/buscar", f"{base}/", f"{base}/promociones",
+        rng.choice(_REFERERS_EXTERNOS), "-",
+    ])
 
 
 _SIG_IDS = {
